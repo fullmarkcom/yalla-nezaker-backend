@@ -1,10 +1,12 @@
 require('dotenv').config();
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const webpush = require('web-push');
 const db = require('./db');
 const { startScheduler } = require('./scheduler');
 const { hashPassword, comparePassword, generateToken, requireAuth, isValidEmail } = require('./auth');
+const { sendPasswordResetEmail } = require('./email');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -63,18 +65,63 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
   res.json({ id: user.id, email: user.email });
 });
 
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'الإيميل مطلوب' });
+
+  const user = db.getUserByEmail(email);
+  if (!user) return res.json({ ok: true });
+
+  const rawToken = crypto.randomBytes(32).toString('hex');
+  const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+  const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+
+  db.createPasswordReset(user.id, tokenHash, expiresAt);
+
+  const frontendUrl = process.env.FRONTEND_URL || 'https://your-frontend-url.netlify.app';
+  const resetLink = `${frontendUrl}?resetToken=${rawToken}`;
+
+  try {
+    await sendPasswordResetEmail(user.email, resetLink);
+  } catch (err) {
+    console.error('فشل إرسال إيميل الاسترجاع:', err.message);
+  }
+
+  res.json({ ok: true });
+});
+
+app.post('/api/auth/reset-password', (req, res) => {
+  const { token, newPassword } = req.body;
+  if (!token || !newPassword) return res.status(400).json({ error: 'التوكن وكلمة السر الجديدة مطلوبين' });
+  if (newPassword.length < 6) return res.status(400).json({ error: 'كلمة السر لازم تكون 6 حروف على الأقل' });
+
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  const resetRecord = db.getValidPasswordReset(tokenHash);
+  if (!resetRecord) return res.status(400).json({ error: 'الرابط منتهي أو مستخدم قبل كده، اطلب رابط جديد' });
+
+  db.updateUserPassword(resetRecord.user_id, hashPassword(newPassword));
+  db.markPasswordResetUsed(resetRecord.id);
+
+  const user = db.getUserById(resetRecord.user_id);
+  const authToken = generateToken(user.id);
+  res.json({ ok: true, token: authToken, user: { id: user.id, email: user.email } });
+});
+
 app.get('/api/sync', requireAuth, (req, res) => {
   const result = db.getAppData(req.userId);
   res.json(result);
 });
 
 app.put('/api/sync', requireAuth, (req, res) => {
-  const { data } = req.body;
+  const { data, version } = req.body;
   if (!data || typeof data !== 'object') {
     return res.status(400).json({ error: 'data مطلوبة وتكون object' });
   }
-  const result = db.setAppData(req.userId, data);
-  res.json({ ok: true, updatedAt: result.updatedAt });
+  const result = db.setAppData(req.userId, data, version);
+  if (result.conflict) {
+    return res.status(409).json({ error: 'فيه تعديل أحدث من جهاز تاني', ...result.server });
+  }
+  res.json({ ok: true, ...result.server });
 });
 
 app.get('/api/vapid-public-key', (req, res) => {
